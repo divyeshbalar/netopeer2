@@ -1,0 +1,498 @@
+/**
+ * @file config.h
+ * @author Michal Vasko <mvasko@cesnet.cz>
+ * @brief cmocka tests configuration header.
+ *
+ * Copyright (c) 2016 CESNET, z.s.p.o.
+ *
+ * This source code is licensed under BSD 3-Clause License (the "License").
+ * You may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     https://opensource.org/licenses/BSD-3-Clause
+ */
+
+#define TESTS_DIR "@CMAKE_SOURCE_DIR@/tests"
+
+#include <sysrepo.h>
+#include <nc_server.h>
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <ctype.h>
+
+/* taken from libnetconf2 session_p.h private header */
+
+struct nc_session {
+    int status;            /**< status of the session */
+    NC_SESSION_TERM_REASON term_reason; /**< reason of termination, if status is NC_STATUS_INVALID */
+    uint32_t killed_by;          /**< session responsible for termination, if term_reason is NC_SESSION_TERM_KILLED */
+    int side;                /**< side of the session: client or server */
+
+    /* NETCONF data */
+    uint32_t id;                 /**< NETCONF session ID (session-id-type) */
+    int version;          /**< NETCONF protocol version */
+
+    /* Transport implementation */
+    NC_TRANSPORT_IMPL ti_type;   /**< transport implementation type to select items from ti union */
+    pthread_mutex_t *io_lock;    /**< input/output lock, note that in case of libssh TI, it will be shared
+                                      with other NETCONF sessions on the same SSH session (but different SSH channel) */
+
+    union {
+        struct {
+            int in;              /**< input file descriptor */
+            int out;             /**< output file descriptor */
+        } fd;                    /**< NC_TI_FD transport implementation structure */
+        struct {
+            int sock;            /**< socket file descriptor */
+        } unixsock;              /**< NC_TI_UNIX transport implementation structure */
+#ifdef NC_ENABLED_SSH
+        struct {
+            void *channel;
+            void *session;
+            struct nc_session *next; /**< pointer to the next NETCONF session on the same
+                                          SSH session, but different SSH channel. If no such session exists, it is NULL.
+                                          otherwise there is a ring list of the NETCONF sessions */
+        } libssh;
+#endif
+#ifdef NC_ENABLED_TLS
+        SSL *tls;
+#endif
+    } ti;                          /**< transport implementation data */
+    const char *username;
+    const char *host;
+    uint16_t port;
+    const char *path;              /**< socket path in case of unix socket */
+
+    /* other */
+    struct ly_ctx *ctx;            /**< libyang context of the session */
+    void *data;                    /**< arbitrary user data */
+    uint8_t flags;                 /**< various flags of the session - TODO combine with status and/or side */
+
+    union {
+        struct {
+            /* client side only data */
+            uint64_t msgid;
+            char **cpblts;                 /**< list of server's capabilities on client side */
+            struct nc_msg_cont *replies;   /**< queue for RPC replies received instead of notifications */
+            struct nc_msg_cont *notifs;    /**< queue for notifications received instead of RPC reply */
+            volatile pthread_t *ntf_tid;   /**< running notifications receiving thread */
+        } client;
+        struct {
+            /* server side only data */
+            time_t session_start;          /**< real time the session was created */
+            time_t last_rpc;               /**< monotonic time (seconds) the last RPC was received on this session */
+            int ntf_status;                /**< flag whether the session is subscribed to any stream */
+
+            pthread_mutex_t *rpc_lock;   /**< lock indicating RPC processing, this lock is always locked before io_lock!! */
+            pthread_cond_t *rpc_cond;    /**< RPC condition (tied with rpc_lock and rpc_inuse) */
+            volatile int *rpc_inuse;     /**< variable indicating whether there is RPC being processed or not (tied with
+                                              rpc_cond and rpc_lock) */
+
+            pthread_mutex_t *ch_lock;      /**< Call Home thread lock */
+            pthread_cond_t *ch_cond;       /**< Call Home thread condition */
+
+            /* server flags */
+#ifdef NC_ENABLED_SSH
+            uint16_t ssh_auth_attempts;    /**< number of failed SSH authentication attempts */
+#endif
+#ifdef NC_ENABLED_TLS
+            X509 *client_cert;                /**< TLS client certificate if used for authentication */
+#endif
+        } server;
+    } opts;
+};
+
+/* wrappers for all the tests */
+int
+__wrap_sr_list_schemas(sr_session_ctx_t *session, sr_schema_t **schemas, size_t *schema_cnt)
+{
+    (void)session;
+
+    *schemas = calloc(16, sizeof **schemas);
+    *schema_cnt = 16;
+
+    (*schemas)[0].module_name = strdup("ietf-netconf-server");
+    (*schemas)[0].installed = 1;
+
+    (*schemas)[1].module_name = strdup("ietf-netconf");
+    (*schemas)[1].ns = strdup("urn:ietf:params:xml:ns:netconf:base:1.0");
+    (*schemas)[1].prefix = strdup("nc");
+    (*schemas)[1].revision.revision = strdup("2011-06-01");
+    (*schemas)[1].revision.file_path_yin = strdup(TESTS_DIR"/files/ietf-netconf.yin");
+    (*schemas)[1].installed = 1;
+
+#ifdef NP2SRV_ENABLED_URL_CAPABILITY
+    (*schemas)[1].enabled_feature_cnt = 7;
+    (*schemas)[1].enabled_features = calloc(7, sizeof *(*schemas)[1].enabled_features);
+#else
+    (*schemas)[1].enabled_feature_cnt = 6;
+    (*schemas)[1].enabled_features = calloc(6, sizeof *(*schemas)[1].enabled_features);
+#endif
+    (*schemas)[1].enabled_features[0] = strdup("writable-running");
+    (*schemas)[1].enabled_features[1] = strdup("candidate");
+    (*schemas)[1].enabled_features[2] = strdup("rollback-on-error");
+    (*schemas)[1].enabled_features[3] = strdup("validate");
+    (*schemas)[1].enabled_features[4] = strdup("startup");
+    (*schemas)[1].enabled_features[5] = strdup("xpath");
+#ifdef NP2SRV_ENABLED_URL_CAPABILITY
+    (*schemas)[1].enabled_features[6] = strdup("url");
+#endif
+
+    (*schemas)[2].module_name = strdup("ietf-netconf-notifications");
+    (*schemas)[2].ns = strdup("urn:ietf:params:xml:ns:yang:ietf-netconf-notifications");
+    (*schemas)[2].prefix = strdup("ncn");
+    (*schemas)[2].revision.revision = strdup("2012-02-06");
+    (*schemas)[2].revision.file_path_yin = strdup(TESTS_DIR"/files/ietf-netconf-notifications.yin");
+    (*schemas)[2].installed = 1;
+
+    (*schemas)[3].module_name = strdup("notifications");
+    (*schemas)[3].ns = strdup("urn:ietf:params:xml:ns:netconf:notification:1.0");
+    (*schemas)[3].prefix = strdup("ncEvent");
+    (*schemas)[3].revision.revision = strdup("2008-07-14");
+    (*schemas)[3].revision.file_path_yin = strdup(TESTS_DIR"/files/notifications.yin");
+    (*schemas)[3].installed = 1;
+
+    (*schemas)[4].module_name = strdup("nc-notifications");
+    (*schemas)[4].ns = strdup("urn:ietf:params:xml:ns:netmod:notification");
+    (*schemas)[4].prefix = strdup("manageEvent");
+    (*schemas)[4].revision.revision = strdup("2008-07-14");
+    (*schemas)[4].revision.file_path_yin = strdup(TESTS_DIR"/files/nc-notifications.yin");
+    (*schemas)[4].installed = 1;
+
+    (*schemas)[5].module_name = strdup("test-notif");
+    (*schemas)[5].ns = strdup("urn:libyang:test:notif");
+    (*schemas)[5].prefix = strdup("tn");
+    (*schemas)[5].revision.revision = strdup("2017-03-22");
+    (*schemas)[5].revision.file_path_yin = strdup(TESTS_DIR"/files/test-notif.yin");
+    (*schemas)[5].installed = 1;
+
+    (*schemas)[6].module_name = strdup("ietf-interfaces");
+    (*schemas)[6].ns = strdup("urn:ietf:params:xml:ns:yang:ietf-interfaces");
+    (*schemas)[6].prefix = strdup("if");
+    (*schemas)[6].revision.revision = strdup("2014-05-08");
+    (*schemas)[6].revision.file_path_yin = strdup(TESTS_DIR"/files/ietf-interfaces.yin");
+    (*schemas)[6].enabled_features = malloc(sizeof(char *));
+    (*schemas)[6].enabled_features[0] = strdup("if-mib");
+    (*schemas)[6].enabled_feature_cnt = 1;
+    (*schemas)[6].installed = 1;
+
+    (*schemas)[7].module_name = strdup("ietf-ip");
+    (*schemas)[7].ns = strdup("urn:ietf:params:xml:ns:yang:ietf-ip");
+    (*schemas)[7].prefix = strdup("ip");
+    (*schemas)[7].revision.revision = strdup("2014-06-16");
+    (*schemas)[7].revision.file_path_yin = strdup(TESTS_DIR"/files/ietf-ip.yin");
+    (*schemas)[7].enabled_features = malloc(2 * sizeof(char *));
+    (*schemas)[7].enabled_features[0] = strdup("ipv4-non-contiguous-netmasks");
+    (*schemas)[7].enabled_features[1] = strdup("ipv6-privacy-autoconf");
+    (*schemas)[7].enabled_feature_cnt = 2;
+    (*schemas)[7].installed = 1;
+
+    (*schemas)[8].module_name = strdup("iana-if-type");
+    (*schemas)[8].ns = strdup("urn:ietf:params:xml:ns:yang:iana-if-type");
+    (*schemas)[8].prefix = strdup("if");
+    (*schemas)[8].revision.revision = strdup("2014-05-08");
+    (*schemas)[8].revision.file_path_yin = strdup(TESTS_DIR"/files/iana-if-type.yin");
+    (*schemas)[8].installed = 1;
+
+    (*schemas)[9].module_name = strdup("test-feature-c");
+    (*schemas)[9].ns = strdup("urn:ietf:params:xml:ns:yang:test-feature-c");
+    (*schemas)[9].prefix = strdup("tfc");
+    (*schemas)[9].revision.revision = strdup("2018-05-18");
+    (*schemas)[9].revision.file_path_yin = strdup(TESTS_DIR"/files/test-feature-c.yin");
+    (*schemas)[9].enabled_features = malloc(sizeof(char *));
+    (*schemas)[9].enabled_features[0] = strdup("test-feature-c");
+    (*schemas)[9].enabled_feature_cnt = 1;
+    (*schemas)[9].installed = 1;
+
+    (*schemas)[10].module_name = strdup("test-feature-b");
+    (*schemas)[10].ns = strdup("urn:ietf:params:xml:ns:yang:test-feature-b");
+    (*schemas)[10].prefix = strdup("tfb");
+    (*schemas)[10].revision.revision = strdup("2018-05-18");
+    (*schemas)[10].revision.file_path_yin = strdup(TESTS_DIR"/files/test-feature-b.yin");
+    (*schemas)[10].enabled_features = malloc(sizeof(char *));
+    (*schemas)[10].enabled_features[0] = strdup("test-feature-b");
+    (*schemas)[10].enabled_feature_cnt = 1;
+    (*schemas)[10].installed = 1;
+
+    (*schemas)[11].module_name = strdup("test-feature-a");
+    (*schemas)[11].ns = strdup("urn:ietf:params:xml:ns:yang:test-feature-a");
+    (*schemas)[11].prefix = strdup("tfa");
+    (*schemas)[11].revision.revision = strdup("2018-05-18");
+    (*schemas)[11].revision.file_path_yin = strdup(TESTS_DIR"/files/test-feature-a.yin");
+    (*schemas)[11].enabled_features = malloc(sizeof(char *));
+    (*schemas)[11].enabled_features[0] = strdup("test-feature-a");
+    (*schemas)[11].enabled_feature_cnt = 1;
+    (*schemas)[11].installed = 1;
+
+    (*schemas)[12].module_name = strdup("simplified-melt");
+    (*schemas)[12].ns = strdup("urn:ietf:params:xml:ns:simplified-melt");
+    (*schemas)[12].prefix = strdup("smelt");
+    (*schemas)[12].revision.revision = strdup("2018-06-13");
+    (*schemas)[12].revision.file_path_yin = strdup(TESTS_DIR"/files/simplified-melt.yin");
+    (*schemas)[12].installed = 1;
+
+    (*schemas)[13].module_name = strdup("ietf-netconf-monitoring");
+    (*schemas)[13].installed = 1;
+
+    (*schemas)[14].module_name = strdup("ietf-netconf-with-defaults");
+    (*schemas)[14].installed = 1;
+
+    (*schemas)[15].module_name = strdup("custom-op");
+    (*schemas)[15].installed = 1;
+
+    return SR_ERR_OK;
+}
+
+int
+__wrap_sr_get_schema(sr_session_ctx_t *session, const char *module_name, const char *revision,
+                     const char *submodule_name, sr_schema_format_t format, char **schema_content)
+{
+    int fd;
+    struct stat st;
+    (void)session;
+    (void)revision;
+    (void)submodule_name;
+
+    if (format != SR_SCHEMA_YIN) {
+        fail();
+    }
+
+    if (!strcmp(module_name, "ietf-netconf-server")) {
+        *schema_content = strdup("<module name=\"ietf-netconf-server\" xmlns=\"urn:ietf:params:xml:ns:yang:yin:1\"><namespace uri=\"ns\"/><prefix value=\"pr\"/></module>");
+        return SR_ERR_OK;
+    }
+    if (!strcmp(module_name, "iana-if-type")) {
+        fd = open(TESTS_DIR "/files/iana-if-type.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "ietf-interfaces")) {
+        fd = open(TESTS_DIR "/files/ietf-interfaces.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "ietf-ip")) {
+        fd = open(TESTS_DIR "/files/ietf-ip.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "custom-op")) {
+        fd = open(TESTS_DIR "/files/custom-op.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "ietf-netconf")) {
+        fd = open(TESTS_DIR "/files/ietf-netconf.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "ietf-netconf-with-defaults")) {
+        fd = open(TESTS_DIR "/files/ietf-netconf-with-defaults.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "ietf-netconf-monitoring")) {
+        fd = open(TESTS_DIR "/files/ietf-netconf-monitoring.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "ietf-netconf-acm")) {
+        fd = open(TESTS_DIR "/files/ietf-netconf-acm.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "ietf-netconf-notifications")) {
+        fd = open(TESTS_DIR "/files/ietf-netconf-notifications.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "notifications")) {
+        fd = open(TESTS_DIR "/files/notifications.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "nc-notifications")) {
+        fd = open(TESTS_DIR "/files/nc-notifications.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "test-notif")) {
+        fd = open(TESTS_DIR "/files/test-notif.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "test-feature-a")) {
+        fd = open(TESTS_DIR "/files/test-feature-a.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "test-feature-b")) {
+        fd = open(TESTS_DIR "/files/test-feature-b.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "test-feature-c")) {
+        fd = open(TESTS_DIR "/files/test-feature-c.yin", O_RDONLY);
+    } else if (!strcmp(module_name, "simplified-melt")) {
+        fd = open(TESTS_DIR "/files/simplified-melt.yin", O_RDONLY);
+    } else {
+        return SR_ERR_NOT_FOUND;
+    }
+
+    if (fd < 0) {
+        return SR_ERR_INTERNAL;
+    }
+
+    assert_int_equal(fstat(fd, &st), 0);
+
+    *schema_content = malloc((st.st_size + 1) * sizeof(char));
+    assert_int_equal(read(fd, *schema_content, st.st_size), st.st_size);
+    close(fd);
+    (*schema_content)[st.st_size] = '\0';
+
+    return SR_ERR_OK;
+}
+
+int
+__wrap_sr_dp_get_items_subscribe(sr_session_ctx_t *session, const char *xpath, sr_dp_get_items_cb callback,
+                                 void *private_ctx, sr_subscr_options_t opts, sr_subscription_ctx_t **subscription)
+{
+    (void)session;
+    (void)xpath;
+    (void)callback;
+    (void)private_ctx;
+    (void)opts;
+    (void)subscription;
+
+    return SR_ERR_OK;
+}
+
+/* common test functions */
+static void
+test_write(int fd, const char *data, int line)
+{
+    int ret, written, to_write;
+
+    written = 0;
+    to_write = strlen(data);
+    do {
+        ret = write(fd, data + written, to_write - written);
+        if (ret == -1) {
+            if (errno != EAGAIN) {
+                fprintf(stderr, "write fail (%s, line %d)\n", strerror(errno), line);
+                fail();
+            }
+            usleep(100000);
+            ret = 0;
+        }
+        written += ret;
+    } while (written < to_write);
+
+    while (((ret = write(fd, "]]>]]>", 6)) == -1) && (errno == EAGAIN));
+    if (ret == -1) {
+        fprintf(stderr, "write fail (%s, line %d)\n", strerror(errno), line);
+        fail();
+    } else if (ret < 6) {
+        fprintf(stderr, "write fail (end tag, written only %d bytes, line %d)\n", ret, line);
+        fail();
+    }
+}
+
+static void
+test_read(int fd, const char *template, int line)
+{
+    char *buf, *ptr;
+    int ret, red, to_read;
+
+    red = 0;
+    to_read = strlen(template);
+    buf = malloc(to_read + 1);
+    do {
+        ret = read(fd, buf + red, to_read - red);
+        if (ret == -1) {
+            if (errno != EAGAIN) {
+                fprintf(stderr, "read fail (%s, line %d)\n", strerror(errno), line);
+                fail();
+            }
+            usleep(100000);
+            ret = 0;
+        }
+        red += ret;
+
+        /* premature ending tag check */
+        if ((red > 5) && !strncmp((buf + red) - 6, "]]>]]>", 6)) {
+            break;
+        }
+    } while (red < to_read);
+    buf[red] = '\0';
+
+    /* unify all datetimes */
+    for (ptr = strstr(buf, "+02:00"); ptr; ptr = strstr(ptr + 1, "+02:00")) {
+        if ((ptr[-3] == ':') && (ptr[-6] == ':') && (ptr[-9] == 'T') && (ptr[-12] == '-') && (ptr[-15] == '-')) {
+            memcpy(ptr - 19, "0000-00-00T00:00:00", 19);
+        }
+    }
+    for (ptr = strchr(buf, '-'); ptr; ptr = strchr(ptr + 1, '-')) {
+        if ((ptr[3] == '-') && (ptr[6] == 'T') && (ptr[9] == ':') && (ptr[12] == ':')) {
+            memcpy(ptr - 4, "0000-00-00T00:00:00", 19);
+        }
+    }
+
+
+    for (red = 0; buf[red]; ++red) {
+        if (buf[red] != template[red]) {
+            fprintf(stderr, "read fail (non-matching template, line %d)\n\"%s\"(%d)\nvs. template\n\"%s\"\n",
+                    line, buf + red, red, template + red);
+            fail();
+        }
+    }
+
+    /* read ending tag */
+    while (((ret = read(fd, buf, 6)) == -1) && (errno == EAGAIN));
+    if (ret == -1) {
+        fprintf(stderr, "read fail (%s, line %d)\n", strerror(errno), line);
+        fail();
+    }
+    buf[ret] = '\0';
+    if ((ret < 6) || strcmp(buf, "]]>]]>")) {
+        fprintf(stderr, "read fail (end tag \"%s\", line %d)\n", buf, line);
+        fail();
+    }
+
+    free(buf);
+}
+
+#ifdef ENABLE_TEST_FILE
+static void
+test_file(const char *path, const char *template, int line)
+{
+    int cc = 0;
+    int fcnt = 0;
+    char buf = '\0';
+    int fc = 0;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0) {
+        fprintf(stderr, "read fail (line %d, could not open file %s)\n", line, path);
+        fail();
+    }
+
+    fc = read(fd, &buf, 1);
+    if (fc < 0) {
+        fprintf(stderr, "read fail (line %d, could not read file %s)\n", line, path);
+        fail();
+    }
+
+    if (*template != buf) {
+        fprintf(stderr, "read fail (line %d, non-matching template char %d)\n\"%c\" vs. template\n\"%c\"\n",
+                line, cc, buf, *template);
+        close(fd);
+        fail();
+    }
+
+    while (1) {
+        do {
+            cc++, template++;
+        } while (*template && isspace(*template));
+
+        do {
+            fcnt++;
+            fc = read(fd, &buf, 1);
+        } while (fc == 1 && isspace(buf));
+
+        if (!*template || fc != 1) {
+            break;
+        }
+
+        if (*template != buf) {
+            fprintf(stderr, "read fail (line %d, non-matching template char %d)\n\"%c\" vs. template\n\"%c\"\n",
+                    line, cc, buf, *template);
+            close(fd);
+            fail();
+        }
+    }
+
+    while (*template) {
+        if (!isspace(*template)) {
+            close(fd);
+            fprintf(stderr, "read fail (characters remaining in template, line %d)\n", line);
+            fail();
+        }
+        template++;
+    }
+
+    while (fc == 1) {
+        if (!isspace(buf)) {
+            close(fd);
+            fprintf(stderr, "read fail (characters remaining in file, line %d)\n", line);
+            fail();
+        }
+        fc = read(fd, &buf, 1);
+    }
+
+    close(fd);
+}
+#endif  // ENABLE_TEST_FILE
